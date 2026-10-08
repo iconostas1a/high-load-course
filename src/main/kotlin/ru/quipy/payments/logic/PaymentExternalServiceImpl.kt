@@ -6,11 +6,14 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -33,10 +36,59 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val rateLimiter = SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
+    private val parallelLimiter = Semaphore(parallelRequests, true)
 
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+
+        val remainsForParallelPermission = deadline - now()
+
+        if (remainsForParallelPermission <= 0) {
+            markNotSent(
+                paymentId,
+                "payment deadline exceeded before waiting for a parallel request permission"
+            )
+            return
+        }
+        val parallelPermitReceived = try {
+            parallelLimiter.tryAcquire(
+                remainsForParallelPermission,
+                TimeUnit.MILLISECONDS
+            )
+        } catch (exception: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!parallelPermitReceived) {
+            markNotSent(
+                paymentId,
+                "no parallel request permission received before deadline"
+            )
+            return
+        }
+        try {
+            val remainingForRatePermit = deadline - now()
+            if (remainingForRatePermit <= 0) {
+                markNotSent(paymentId, "deadline exceeded before waiting for a rate limit permit")
+                return
+            }
+            val ratePermitReceived = rateLimiter.tickBlocking(Duration.ofMillis(remainingForRatePermit))
+            if (!ratePermitReceived) {
+                markNotSent(paymentId, "no rate limit permit received before payment deadline")
+                return
+            }
+            sendPaymentRequest(paymentId, amount, paymentStartedAt)
+        }
+        finally {
+            parallelLimiter.release()
+        }
+
+
+    }
+
+    private fun sendPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -88,6 +140,13 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        }
+    }
+
+    private fun markNotSent(paymentId: UUID, reason: String) {
+        logger.warn("[$accountName] payment $paymentId was not sent: $reason")
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), reason = reason)
         }
     }
 
