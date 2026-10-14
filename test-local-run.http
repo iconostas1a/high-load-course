@@ -6,10 +6,13 @@ Content-Type: application/json
   "serviceName": "{{serviceName}}",
   "token": "{{token}}",
   "ratePerSecond": 2,
-  "testCount": 100,
+  "testCount": 500,
   "processingTimeMillis": 60000
 }
 
 ### Stop running test to save time and resources
 # @timeout 120
 POST http://localhost:1234/test/stop/{{serviceName}}
+
+### acc constraints
+GET http://localhost:1234/external/accounts?serviceName={{serviceName}}&token={{token}}
