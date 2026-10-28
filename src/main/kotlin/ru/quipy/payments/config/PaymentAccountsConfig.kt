@@ -48,22 +48,23 @@ class PaymentAccountsConfig {
         val resp = javaClient.send(request, HttpResponse.BodyHandlers.ofString())
 
         println("\nPayment accounts list:")
-        val adapters = mapper.readValue<List<PaymentAccountProperties>>(
+        val accountProperties = mapper.readValue<List<PaymentAccountProperties>>(
             resp.body(),
             mapper.typeFactory.constructCollectionType(List::class.java, PaymentAccountProperties::class.java)
         )
             .filter { it.accountName in allowedAccounts }
             .map { it.copy(enabled = true) }
             .onEach(::println)
-            .map {
-                PaymentExternalSystemAdapterImpl(
-                    it,
-                    paymentEventService,
-                    paymentProviderHostPort,
-                    token,
-                    meterRegistry,
-                )
-            }
-        return PaymentSystemImpl(adapters)
+
+        val adapters = accountProperties.map {
+            PaymentExternalSystemAdapterImpl(
+                it,
+                paymentEventService,
+                paymentProviderHostPort,
+                token,
+                meterRegistry,
+            )
+        }
+        return PaymentSystemImpl(adapters, accountProperties)
     }
 }
