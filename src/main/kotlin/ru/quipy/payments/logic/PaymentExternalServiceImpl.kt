@@ -2,15 +2,19 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -19,6 +23,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -33,10 +38,58 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-
+    private val rateLimiter = SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
+    private val parallelLimiter = Semaphore(parallelRequests, true)
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+
+        val remainsForParallelPermission = deadline - now()
+
+        if (remainsForParallelPermission <= 0) {
+            markNotSent(
+                paymentId,
+                "payment deadline exceeded before waiting for a parallel request permission"
+            )
+            return
+        }
+        val parallelPermitReceived = try {
+            parallelLimiter.tryAcquire(
+                remainsForParallelPermission,
+                TimeUnit.MILLISECONDS
+            )
+        } catch (exception: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!parallelPermitReceived) {
+            markNotSent(
+                paymentId,
+                "no parallel request permission received before deadline"
+            )
+            return
+        }
+        try {
+            val remainingForRatePermit = deadline - now()
+            if (remainingForRatePermit <= 0) {
+                markNotSent(paymentId, "deadline exceeded before waiting for a rate limit permit")
+                return
+            }
+            val ratePermitReceived = rateLimiter.tickBlocking(Duration.ofMillis(remainingForRatePermit))
+            if (!ratePermitReceived) {
+                markNotSent(paymentId, "no rate limit permit received before payment deadline")
+                return
+            }
+            sendPaymentRequest(paymentId, amount, paymentStartedAt)
+        }
+        finally {
+            parallelLimiter.release()
+        }
+
+
+    }
+
+    private fun sendPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -55,6 +108,13 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
+            meterRegistry.counter(
+                "online_shop_payments",
+                "stage", "outgoing",
+                "account", accountName,
+                "outcome", "none"
+            ).increment()
+
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -70,6 +130,12 @@ class PaymentExternalSystemAdapterImpl(
                 paymentESService.update(paymentId) {
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
+                meterRegistry.counter(
+                    "online_shop_payments",
+                    "stage", "completed",
+                    "account", accountName,
+                    "outcome", if (body.result) "success" else "failed"
+                ).increment()
             }
         } catch (e: Exception) {
             when (e) {
@@ -78,6 +144,12 @@ class PaymentExternalSystemAdapterImpl(
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                     }
+                    meterRegistry.counter(
+                        "online_shop_payments",
+                        "stage", "completed",
+                        "account", accountName,
+                        "outcome", "timeout"
+                    ).increment()
                 }
 
                 else -> {
@@ -86,9 +158,28 @@ class PaymentExternalSystemAdapterImpl(
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = e.message)
                     }
+                    meterRegistry.counter(
+                        "online_shop_payments",
+                        "stage", "completed",
+                        "account", accountName,
+                        "outcome", "failed"
+                    ).increment()
                 }
             }
         }
+    }
+
+    private fun markNotSent(paymentId: UUID, reason: String) {
+        logger.warn("[$accountName] payment $paymentId was not sent: $reason")
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), reason = reason)
+        }
+        meterRegistry.counter(
+            "online_shop_payments",
+            "stage", "completed",
+            "account", accountName,
+            "outcome", "timeout"
+        ).increment()
     }
 
     override fun price() = properties.price

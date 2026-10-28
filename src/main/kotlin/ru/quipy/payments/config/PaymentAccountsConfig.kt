@@ -3,6 +3,7 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
@@ -14,7 +15,6 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.*
-
 
 @Configuration
 class PaymentAccountsConfig {
@@ -36,7 +36,10 @@ class PaymentAccountsConfig {
     lateinit var allowedAccounts: List<String>
 
     @Bean
-    fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
+    fun paymentSystem(
+        paymentEventService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
+        meterRegistry: MeterRegistry,
+    ): PaymentService {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
             .GET()
@@ -45,20 +48,23 @@ class PaymentAccountsConfig {
         val resp = javaClient.send(request, HttpResponse.BodyHandlers.ofString())
 
         println("\nPayment accounts list:")
-        return mapper.readValue<List<PaymentAccountProperties>>(
+        val accountProperties = mapper.readValue<List<PaymentAccountProperties>>(
             resp.body(),
             mapper.typeFactory.constructCollectionType(List::class.java, PaymentAccountProperties::class.java)
         )
             .filter { it.accountName in allowedAccounts }
             .map { it.copy(enabled = true) }
             .onEach(::println)
-            .map {
-                PaymentExternalSystemAdapterImpl(
-                    it,
-                    paymentService,
-                    paymentProviderHostPort,
-                    token
-                )
-            }
+
+        val adapters = accountProperties.map {
+            PaymentExternalSystemAdapterImpl(
+                it,
+                paymentEventService,
+                paymentProviderHostPort,
+                token,
+                meterRegistry,
+            )
+        }
+        return PaymentSystemImpl(adapters, accountProperties)
     }
 }
