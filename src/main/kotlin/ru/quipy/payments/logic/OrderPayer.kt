@@ -23,6 +23,7 @@ class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
+        private const val EXTRA_THREADS = 2
     }
 
     @Autowired
@@ -46,12 +47,11 @@ class OrderPayer {
             account.parallelRequests * 1_000.0 / processingMillis,
         ).coerceAtLeast(1.0)
     }
-
     private val maxConcurrentRequests by lazy {
         minOf(
             account.parallelRequests,
             ceil(throughputPerSecond * processingMillis / 1_000.0).toInt(),
-        ).coerceAtLeast(1)
+        ).coerceAtLeast(1) + EXTRA_THREADS
     }
 
     private val paymentsInProgress = AtomicInteger(0)
@@ -70,6 +70,8 @@ class OrderPayer {
 
     @PostConstruct
     fun registerExecutorMetrics() {
+        logger.info("Payment executor workers: {}", maxConcurrentRequests)
+
         Gauge.builder(
             "order_payer_queue_size",
             paymentExecutor.queue
@@ -90,10 +92,7 @@ class OrderPayer {
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
 
-        if (!reservePlaceBefore(deadline)) {
-            logger.warn("Payment $paymentId cannot be completed before deadline")
-            return createdAt
-        }
+        if (!reservePlaceBefore(deadline)) return createdAt
 
         paymentExecutor.submit {
             try {
@@ -119,8 +118,9 @@ class OrderPayer {
             val inProgress = paymentsInProgress.get()
             val waiting = maxOf(0, inProgress + 1 - maxConcurrentRequests)
             val waitMillis = ceil(waiting * 1_000.0 / throughputPerSecond).toLong()
+            val remainingMillis = deadline - System.currentTimeMillis()
 
-            if (System.currentTimeMillis() + waitMillis + processingMillis > deadline) {
+            if (waitMillis + processingMillis > remainingMillis) {
                 return false
             }
 

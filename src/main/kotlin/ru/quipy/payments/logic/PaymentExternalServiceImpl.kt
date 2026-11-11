@@ -41,12 +41,16 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
     private val parallelLimiter = Semaphore(parallelRequests, true)
     private val client = OkHttpClient.Builder().build()
+    private val processingMillis = requestAverageProcessingTime.toMillis().coerceAtLeast(1L)
+
+    private fun remainingWaitMillis(deadline: Long): Long = deadline - now() - processingMillis
+
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
 
-        val remainsForParallelPermission = deadline - now()
+        val waitForParallel = remainingWaitMillis(deadline)
 
-        if (remainsForParallelPermission <= 0) {
+        if (waitForParallel <= 0) {
             markNotSent(
                 paymentId,
                 "payment deadline exceeded before waiting for a parallel request permission"
@@ -55,7 +59,7 @@ class PaymentExternalSystemAdapterImpl(
         }
         val parallelPermitReceived = try {
             parallelLimiter.tryAcquire(
-                remainsForParallelPermission,
+                waitForParallel,
                 TimeUnit.MILLISECONDS
             )
         } catch (exception: InterruptedException) {
@@ -70,14 +74,14 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
         try {
-            val remainingForRatePermit = deadline - now()
-            if (remainingForRatePermit <= 0) {
+            val waitForRate = remainingWaitMillis(deadline)
+            if (waitForRate <= 0 || !rateLimiter.tickBlocking(Duration.ofMillis(waitForRate))) {
                 markNotSent(paymentId, "deadline exceeded before waiting for a rate limit permit")
                 return
             }
-            val ratePermitReceived = rateLimiter.tickBlocking(Duration.ofMillis(remainingForRatePermit))
-            if (!ratePermitReceived) {
-                markNotSent(paymentId, "no rate limit permit received before payment deadline")
+
+            if (remainingWaitMillis(deadline) <= 0) {
+                markNotSent(paymentId, "not enough time to process payment")
                 return
             }
             sendPaymentRequest(paymentId, amount, paymentStartedAt)
