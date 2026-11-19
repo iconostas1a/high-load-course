@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -31,6 +32,8 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+        private const val MAX_ATTEMPTS = 3
+        private const val RETRY_DELAY_MILLIS = 100L
     }
 
     private val serviceName = properties.serviceName
@@ -45,73 +48,99 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun remainingWaitMillis(deadline: Long): Long = deadline - now() - processingMillis
 
+    private data class AttemptResult(
+        val success: Boolean,
+        val retryable: Boolean,
+        val reason: String?,
+    )
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val transactionId = UUID.randomUUID()
+        var submitted = false
+        var result: AttemptResult? = null
+        var failureReason = "payment deadline exceeded before sending"
 
-        val waitForParallel = remainingWaitMillis(deadline)
+        for (attempt in 1..MAX_ATTEMPTS) {
+            val waitForParallel = remainingWaitMillis(deadline)
+            if (waitForParallel <= 0) break
 
-        if (waitForParallel <= 0) {
-            markNotSent(
-                paymentId,
-                "payment deadline exceeded before waiting for a parallel request permission"
-            )
-            return
-        }
-        val parallelPermitReceived = try {
-            parallelLimiter.tryAcquire(
-                waitForParallel,
-                TimeUnit.MILLISECONDS
-            )
-        } catch (exception: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        }
-        if (!parallelPermitReceived) {
-            markNotSent(
-                paymentId,
-                "no parallel request permission received before deadline"
-            )
-            return
-        }
-        try {
-            val waitForRate = remainingWaitMillis(deadline)
-            if (waitForRate <= 0 || !rateLimiter.tickBlocking(Duration.ofMillis(waitForRate))) {
-                markNotSent(paymentId, "deadline exceeded before waiting for a rate limit permit")
-                return
+            val parallelPermitReceived = try {
+                parallelLimiter.tryAcquire(waitForParallel, TimeUnit.MILLISECONDS)
+            } catch (exception: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!parallelPermitReceived) {
+                failureReason = "no parallel request permission received before deadline"
+                break
             }
 
-            if (remainingWaitMillis(deadline) <= 0) {
-                markNotSent(paymentId, "not enough time to process payment")
-                return
+            try {
+                val waitForRate = remainingWaitMillis(deadline)
+                if (waitForRate <= 0 || !rateLimiter.tickBlocking(Duration.ofMillis(waitForRate))) {
+                    failureReason = "no rate limit permission received before deadline"
+                    break
+                }
+
+                if (!submitted) {
+                    paymentESService.update(paymentId) {
+                        it.logSubmission(
+                            success = true,
+                            transactionId,
+                            now(),
+                            Duration.ofMillis(now() - paymentStartedAt)
+                        )
+                    }
+                    submitted = true
+                }
+
+                result = sendPaymentRequest(paymentId, amount, transactionId, deadline)
+            } finally {
+                parallelLimiter.release()
             }
-            sendPaymentRequest(paymentId, amount, paymentStartedAt)
-        }
-        finally {
-            parallelLimiter.release()
+
+            if (result.success || !result.retryable || attempt == MAX_ATTEMPTS) break
+            if (now() + RETRY_DELAY_MILLIS + processingMillis >= deadline) break
+
+            try {
+                Thread.sleep(RETRY_DELAY_MILLIS)
+            } catch (exception: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
         }
 
+        if (!submitted) {
+            markNotSent(paymentId, failureReason)
+            return
+        }
 
+        val finalResult = result ?: AttemptResult(false, false, failureReason)
+        paymentESService.update(paymentId) {
+            it.logProcessing(finalResult.success, now(), transactionId, reason = finalResult.reason)
+        }
+        meterRegistry.counter(
+            "online_shop_payments",
+            "stage", "completed",
+            "account", accountName,
+            "outcome", if (finalResult.success) "success" else "failed"
+        ).increment()
     }
 
-    private fun sendPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
+    private fun sendPaymentRequest(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        deadline: Long,
+    ): AttemptResult {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-        val transactionId = UUID.randomUUID()
+        val request = Request.Builder().run {
+            url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+            post(emptyBody)
+        }.build()
 
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
-
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
-        try {
-            val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
-
+        return try {
             meterRegistry.counter(
                 "online_shop_payments",
                 "stage", "outgoing",
@@ -119,57 +148,33 @@ class PaymentExternalSystemAdapterImpl(
                 "outcome", "none"
             ).increment()
 
-            client.newCall(request).execute().use { response ->
+            val call = client.newCall(request)
+            call.timeout().timeout((deadline - now()).coerceAtLeast(1L), TimeUnit.MILLISECONDS)
+            call.execute().use { response ->
+                if (response.code == 408 || response.code == 429 || response.code >= 500) {
+                    return AttemptResult(false, true, "HTTP ${response.code}")
+                }
+
+                val responseBody = response.body?.string()
                 val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                    mapper.readValue(responseBody, ExternalSysResponse::class.java)
+                } catch (exception: Exception) {
+                    logger.error("[$accountName] Invalid response for payment $paymentId: HTTP ${response.code}", exception)
+                    return AttemptResult(false, false, "Invalid provider response")
                 }
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
-                meterRegistry.counter(
-                    "online_shop_payments",
-                    "stage", "completed",
-                    "account", accountName,
-                    "outcome", if (body.result) "success" else "failed"
-                ).increment()
+                val success = response.isSuccessful && body.result
+                AttemptResult(success, false, body.message)
             }
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                    meterRegistry.counter(
-                        "online_shop_payments",
-                        "stage", "completed",
-                        "account", accountName,
-                        "outcome", "timeout"
-                    ).increment()
-                }
-
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                    meterRegistry.counter(
-                        "online_shop_payments",
-                        "stage", "completed",
-                        "account", accountName,
-                        "outcome", "failed"
-                    ).increment()
-                }
-            }
+        } catch (exception: SocketTimeoutException) {
+            logger.error("[$accountName] Payment timeout for $paymentId", exception)
+            AttemptResult(false, true, "Request timeout")
+        } catch (exception: IOException) {
+            logger.error("[$accountName] payment request failed for $paymentId", exception)
+            AttemptResult(false, true, exception.message)
+        } catch (exception: Exception) {
+            logger.error("[$accountName] payment failed for $paymentId", exception)
+            AttemptResult(false, false, exception.message)
         }
     }
 
