@@ -35,10 +35,14 @@ class PaymentAccountsConfig {
     @Value("#{'\${payment.accounts}'.split(',')}")
     lateinit var allowedAccounts: List<String>
 
+    @Value("\${payment.request-timeout-millis}")
+    var requestTimeoutMillis: Long = 2_000
+
     @Bean
     fun paymentSystem(
         paymentEventService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
         meterRegistry: MeterRegistry,
+        attemptDurationStore: PaymentAttemptDurationStore,
     ): PaymentService {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
@@ -63,6 +67,8 @@ class PaymentAccountsConfig {
                 paymentProviderHostPort,
                 token,
                 meterRegistry,
+                requestTimeoutMillis,
+                attemptDurationStore,
             )
         }
         return PaymentSystemImpl(adapters, accountProperties)
